@@ -1,27 +1,51 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
+import http.client
 import json
 import os
+import time
 import urllib.error
 import urllib.request
+
+MAX_RATE_LIMIT_RETRIES = 6
+MAX_RETRY_WAIT = 90  # giây; Retry-After lớn hơn coi như hết quota, không chờ
 
 CONFIG = {
     'openai': ('OPENAI_API_KEY', 'https://api.openai.com/v1/chat/completions'),
     'gemini': ('GEMINI_API_KEY', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'),
     'openrouter': ('OPENROUTER_API_KEY', 'https://openrouter.ai/api/v1/chat/completions'),
+    'groq': ('GROQ_API_KEY', 'https://api.groq.com/openai/v1/chat/completions'),
     'anthropic': ('ANTHROPIC_API_KEY', 'https://api.anthropic.com/v1/messages'),
 }
 
 
 def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', 'User-Agent': 'StatusAgentLab/1.0 (educational classroom)', **headers})
+    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        last = attempt >= MAX_RATE_LIMIT_RETRIES
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429 and not last:
+                # Rate limit: đọc Retry-After rồi chờ có giới hạn, không gọi dồn dập.
+                try:
+                    wait = float(exc.headers.get('Retry-After', 15))
+                except (TypeError, ValueError):
+                    wait = 15.0
+                if wait <= MAX_RETRY_WAIT:  # quota theo ngày (chờ hàng chục phút) thì báo lỗi ngay
+                    time.sleep(max(wait, 1.0) + 1.0)
+                    continue
+            elif exc.code in (500, 502, 503, 504) and not last:
+                time.sleep(3 * (attempt + 1))  # lỗi tạm thời phía provider
+                continue
+            # Do not print response bodies: they may contain account or request data.
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except (OSError, http.client.HTTPException) as exc:  # gồm URLError, timeout, kết nối bị đóng
+            if not last:
+                time.sleep(3 * (attempt + 1))  # timeout/mất kết nối thoáng qua
+                continue
+            reason = getattr(exc, 'reason', exc)
+            raise RuntimeError(f'Không kết nối được provider: {reason}') from exc
 
 
 class Provider:
